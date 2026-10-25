@@ -1,21 +1,24 @@
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import { parse } from "url";
+import {
+  DrawElement,
+  MAX_POINTS_PER_STROKE,
+  cleanElement,
+  cleanPoint,
+  cleanPoints,
+} from "./elements";
+import { loadRoom, saveRoom } from "./storage";
 
 const app = express();
 
 const PORT = process.env.PORT || 8080;
-// Keep enough strokes for a late joiner to see the drawing, without unbounded memory.
-const MAX_HISTORY = 20000;
-const MAX_MESSAGE_BYTES = 4 * 1024;
+// Keep rooms bounded; the oldest elements fall off first.
+const MAX_ELEMENTS = 5000;
+const MAX_MESSAGE_BYTES = 256 * 1024;
+const SAVE_DELAY_MS = 2000;
+const EVICT_DELAY_MS = 10 * 60 * 1000;
 const ROOM_ID_PATTERN = /^[A-Za-z0-9]{4,12}$/;
-
-type Segment = {
-  from: { x: number; y: number };
-  to: { x: number; y: number };
-  color: string;
-  size: number;
-};
 
 type Member = {
   connectionId: string;
@@ -24,7 +27,14 @@ type Member = {
   image: string | null;
 };
 
-type Room = { clients: Set<WebSocket>; history: Segment[] };
+type Room = {
+  id: string;
+  clients: Set<WebSocket>;
+  elements: Map<string, DrawElement>;
+  ready: Promise<void>;
+  saveTimer?: NodeJS.Timeout;
+  evictTimer?: NodeJS.Timeout;
+};
 
 const rooms: { [roomId: string]: Room } = {};
 const alive = new WeakMap<WebSocket, boolean>();
@@ -43,32 +53,59 @@ const wss = new WebSocketServer({
   maxPayload: MAX_MESSAGE_BYTES,
 });
 
-function joinRoom(ws: WebSocket, roomId: string) {
+function getRoom(roomId: string) {
   if (!rooms[roomId]) {
-    rooms[roomId] = { clients: new Set(), history: [] };
+    const room: Room = {
+      id: roomId,
+      clients: new Set(),
+      elements: new Map(),
+      ready: Promise.resolve(),
+    };
+    room.ready = loadRoom(roomId).then((elements) => {
+      elements.forEach((el) => room.elements.set(el.id, el));
+    });
+    rooms[roomId] = room;
   }
-  rooms[roomId].clients.add(ws);
   return rooms[roomId];
 }
 
-function broadcastToRoom(roomId: string, message: string, senderWs?: WebSocket) {
-  rooms[roomId]?.clients.forEach((client) => {
+function scheduleSave(room: Room) {
+  clearTimeout(room.saveTimer);
+  room.saveTimer = setTimeout(() => {
+    saveRoom(room.id, Array.from(room.elements.values()));
+  }, SAVE_DELAY_MS);
+}
+
+function flushSave(room: Room) {
+  if (!room.saveTimer) return;
+  clearTimeout(room.saveTimer);
+  room.saveTimer = undefined;
+  return saveRoom(room.id, Array.from(room.elements.values()));
+}
+
+function addElement(room: Room, element: DrawElement) {
+  room.elements.delete(element.id);
+  room.elements.set(element.id, element);
+  if (room.elements.size > MAX_ELEMENTS) {
+    const oldest = room.elements.keys().next().value;
+    if (oldest) room.elements.delete(oldest);
+  }
+}
+
+function broadcast(room: Room, message: unknown, senderWs?: WebSocket) {
+  const data = JSON.stringify(message);
+  room.clients.forEach((client) => {
     if (client !== senderWs && client.readyState === WebSocket.OPEN) {
-      client.send(message);
+      client.send(data);
     }
   });
 }
 
-function broadcastPresence(roomId: string) {
-  const room = rooms[roomId];
-  if (!room) return;
+function broadcastPresence(room: Room) {
   const users = Array.from(room.clients, (client) => members.get(client)).filter(
     (member): member is Member => !!member
   );
-  broadcastToRoom(
-    roomId,
-    JSON.stringify({ type: "presence", count: room.clients.size, users })
-  );
+  broadcast(room, { type: "presence", count: room.clients.size, users });
 }
 
 function cleanString(value: unknown, maxLength: number) {
@@ -77,20 +114,65 @@ function cleanString(value: unknown, maxLength: number) {
     : null;
 }
 
-function isValidSegment(value: unknown): value is Segment {
-  const s = value as Segment;
-  return (
-    !!s &&
-    typeof s.color === "string" &&
-    s.color.length <= 32 &&
-    typeof s.size === "number" &&
-    s.size > 0 &&
-    s.size <= 200 &&
-    [s.from?.x, s.from?.y, s.to?.x, s.to?.y].every(Number.isFinite)
-  );
+function handleMessage(ws: WebSocket, room: Room, data: Record<string, any>) {
+  const member = members.get(ws);
+
+  switch (data.type) {
+    case "join": {
+      // Identity is self-reported by the client; good enough for showing who's here.
+      if (!member) return;
+      const image = cleanString(data.user?.image, 500);
+      member.userId = cleanString(data.user?.id, 64);
+      member.name = cleanString(data.user?.name, 60) ?? "Guest";
+      member.image = image?.startsWith("https://") ? image : null;
+      broadcastPresence(room);
+      return;
+    }
+    case "add": {
+      const element = cleanElement(data.element);
+      if (!element) return;
+      addElement(room, element);
+      broadcast(room, { type: "add", element }, ws);
+      scheduleSave(room);
+      return;
+    }
+    case "append": {
+      const stroke = room.elements.get(data.id);
+      const points = cleanPoints(data.points, 500);
+      if (stroke?.kind !== "stroke" || !points) return;
+      if (stroke.points.length + points.length > MAX_POINTS_PER_STROKE) return;
+      stroke.points.push(...points);
+      broadcast(room, { type: "append", id: stroke.id, points }, ws);
+      scheduleSave(room);
+      return;
+    }
+    case "remove": {
+      if (typeof data.id !== "string" || !room.elements.delete(data.id)) return;
+      broadcast(room, { type: "remove", id: data.id }, ws);
+      scheduleSave(room);
+      return;
+    }
+    case "clear": {
+      room.elements.clear();
+      broadcast(room, { type: "clear" }, ws);
+      scheduleSave(room);
+      return;
+    }
+    case "cursor": {
+      if (!member) return;
+      const point = cleanPoint(data);
+      if (!point) return;
+      broadcast(
+        room,
+        { type: "cursor", connectionId: member.connectionId, ...point },
+        ws
+      );
+      return;
+    }
+  }
 }
 
-wss.on("connection", function connection(ws, req) {
+wss.on("connection", async function connection(ws, req) {
   const { query } = parse(req.url || "", true);
   const roomId = String(query.roomId || "").toUpperCase();
 
@@ -100,58 +182,52 @@ wss.on("connection", function connection(ws, req) {
     return;
   }
 
-  const room = joinRoom(ws, roomId);
+  const room = getRoom(roomId);
+  clearTimeout(room.evictTimer);
+  room.clients.add(ws);
   alive.set(ws, true);
-  members.set(ws, {
+  const member: Member = {
     connectionId: Math.random().toString(36).slice(2, 10),
     userId: null,
     name: "Guest",
     image: null,
-  });
+  };
+  members.set(ws, member);
   ws.on("pong", () => alive.set(ws, true));
 
-  ws.send(JSON.stringify({ type: "history", segments: room.history }));
-  broadcastPresence(roomId);
+  // Messages can arrive while the room is still loading from the database.
+  const ready = room.ready;
 
-  ws.on("message", function message(data) {
+  ws.on("message", async function message(raw) {
+    await ready;
     try {
-      const parsedData = JSON.parse(data.toString());
-      if (parsedData.type === "draw" && isValidSegment(parsedData.segment)) {
-        const { from, to, color, size } = parsedData.segment;
-        const segment = { from, to, color, size };
-        room.history.push(segment);
-        if (room.history.length > MAX_HISTORY) room.history.shift();
-        broadcastToRoom(roomId, JSON.stringify({ type: "draw", segment }), ws);
-      } else if (parsedData.type === "join") {
-        // Identity is self-reported by the client; good enough for showing who's here.
-        const member = members.get(ws);
-        if (member) {
-          const image = cleanString(parsedData.user?.image, 500);
-          member.userId = cleanString(parsedData.user?.id, 64);
-          member.name = cleanString(parsedData.user?.name, 60) ?? "Guest";
-          member.image = image?.startsWith("https://") ? image : null;
-          broadcastPresence(roomId);
-        }
-      } else if (parsedData.type === "clear") {
-        room.history = [];
-        broadcastToRoom(roomId, JSON.stringify({ type: "clear" }), ws);
-      }
+      handleMessage(ws, room, JSON.parse(raw.toString()));
     } catch (error) {
-      console.error("Error parsing message", error);
+      console.error("Error handling message", error);
     }
   });
 
   ws.on("close", () => {
     room.clients.delete(ws);
-    if (room.clients.size === 0) {
-      // Keep the drawing briefly so a refresh doesn't wipe it.
-      setTimeout(() => {
-        if (rooms[roomId]?.clients.size === 0) delete rooms[roomId];
-      }, 10 * 60 * 1000);
-    } else {
-      broadcastPresence(roomId);
-    }
+    broadcastPresence(room);
+    if (room.clients.size > 0) return;
+    flushSave(room);
+    // Keep the room warm briefly so a refresh doesn't hit the database again.
+    room.evictTimer = setTimeout(() => {
+      if (room.clients.size === 0 && rooms[roomId] === room) delete rooms[roomId];
+    }, EVICT_DELAY_MS);
   });
+
+  await ready;
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(
+    JSON.stringify({
+      type: "init",
+      connectionId: member.connectionId,
+      elements: Array.from(room.elements.values()),
+    })
+  );
+  broadcastPresence(room);
 });
 
 // Drop connections that vanished without a close frame (closed laptop, lost network).
@@ -163,4 +239,9 @@ const heartbeat = setInterval(() => {
   });
 }, 30000);
 
-wss.on("close", () => clearInterval(heartbeat));
+// Render sends SIGTERM on redeploys; persist anything pending first.
+process.on("SIGTERM", async () => {
+  clearInterval(heartbeat);
+  await Promise.all(Object.values(rooms).map(flushSave));
+  process.exit(0);
+});
