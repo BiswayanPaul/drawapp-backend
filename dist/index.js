@@ -7,42 +7,81 @@ const express_1 = __importDefault(require("express"));
 const ws_1 = require("ws");
 const url_1 = require("url");
 const app = (0, express_1.default)();
-const httpServer = app.listen(8080, () => {
-    console.log("HTTP server listening on port 8080");
-});
-const wss = new ws_1.WebSocketServer({ server: httpServer });
+const PORT = process.env.PORT || 8080;
+// Keep enough strokes for a late joiner to see the drawing, without unbounded memory.
+const MAX_HISTORY = 20000;
+const MAX_MESSAGE_BYTES = 4 * 1024;
+const ROOM_ID_PATTERN = /^[A-Za-z0-9]{4,12}$/;
 const rooms = {};
+const alive = new WeakMap();
+app.get(["/", "/health"], (_req, res) => {
+    res.json({ status: "ok", rooms: Object.keys(rooms).length });
+});
+const httpServer = app.listen(PORT, () => {
+    console.log(`HTTP + WebSocket server listening on port ${PORT}`);
+});
+const wss = new ws_1.WebSocketServer({
+    server: httpServer,
+    maxPayload: MAX_MESSAGE_BYTES,
+});
 function joinRoom(ws, roomId) {
     if (!rooms[roomId]) {
-        rooms[roomId] = new Set();
+        rooms[roomId] = { clients: new Set(), history: [] };
     }
-    rooms[roomId].add(ws);
+    rooms[roomId].clients.add(ws);
+    return rooms[roomId];
 }
 function broadcastToRoom(roomId, message, senderWs) {
-    if (rooms[roomId]) {
-        rooms[roomId].forEach((client) => {
-            if (client !== senderWs && client.readyState === ws_1.WebSocket.OPEN) {
-                client.send(message);
-            }
-        });
-    }
+    var _a;
+    (_a = rooms[roomId]) === null || _a === void 0 ? void 0 : _a.clients.forEach((client) => {
+        if (client !== senderWs && client.readyState === ws_1.WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+}
+function broadcastPresence(roomId) {
+    const room = rooms[roomId];
+    if (!room)
+        return;
+    broadcastToRoom(roomId, JSON.stringify({ type: "presence", count: room.clients.size }));
+}
+function isValidSegment(value) {
+    var _a, _b, _c, _d;
+    const s = value;
+    return (!!s &&
+        typeof s.color === "string" &&
+        s.color.length <= 32 &&
+        typeof s.size === "number" &&
+        s.size > 0 &&
+        s.size <= 200 &&
+        [(_a = s.from) === null || _a === void 0 ? void 0 : _a.x, (_b = s.from) === null || _b === void 0 ? void 0 : _b.y, (_c = s.to) === null || _c === void 0 ? void 0 : _c.x, (_d = s.to) === null || _d === void 0 ? void 0 : _d.y].every(Number.isFinite));
 }
 wss.on("connection", function connection(ws, req) {
     const { query } = (0, url_1.parse)(req.url || "", true);
-    const roomId = query.roomId;
-    if (!roomId) {
-        ws.send(JSON.stringify({ error: "No room ID provided." }));
+    const roomId = String(query.roomId || "").toUpperCase();
+    if (!ROOM_ID_PATTERN.test(roomId)) {
+        ws.send(JSON.stringify({ type: "error", error: "Invalid room ID." }));
         ws.close();
         return;
     }
-    joinRoom(ws, roomId);
+    const room = joinRoom(ws, roomId);
+    alive.set(ws, true);
+    ws.on("pong", () => alive.set(ws, true));
+    ws.send(JSON.stringify({ type: "history", segments: room.history }));
+    broadcastPresence(roomId);
     ws.on("message", function message(data) {
         try {
             const parsedData = JSON.parse(data.toString());
-            if (parsedData.type === "draw") {
-                broadcastToRoom(roomId, data.toString(), ws);
+            if (parsedData.type === "draw" && isValidSegment(parsedData.segment)) {
+                const { from, to, color, size } = parsedData.segment;
+                const segment = { from, to, color, size };
+                room.history.push(segment);
+                if (room.history.length > MAX_HISTORY)
+                    room.history.shift();
+                broadcastToRoom(roomId, JSON.stringify({ type: "draw", segment }), ws);
             }
             else if (parsedData.type === "clear") {
+                room.history = [];
                 broadcastToRoom(roomId, JSON.stringify({ type: "clear" }), ws);
             }
         }
@@ -51,13 +90,27 @@ wss.on("connection", function connection(ws, req) {
         }
     });
     ws.on("close", () => {
-        if (rooms[roomId]) {
-            rooms[roomId].delete(ws);
-            if (rooms[roomId].size === 0) {
-                delete rooms[roomId];
-            }
+        room.clients.delete(ws);
+        if (room.clients.size === 0) {
+            // Keep the drawing briefly so a refresh doesn't wipe it.
+            setTimeout(() => {
+                var _a;
+                if (((_a = rooms[roomId]) === null || _a === void 0 ? void 0 : _a.clients.size) === 0)
+                    delete rooms[roomId];
+            }, 10 * 60 * 1000);
+        }
+        else {
+            broadcastPresence(roomId);
         }
     });
-    ws.send(JSON.stringify({ type: "info", message: `Connected to room: ${roomId}` }));
 });
-console.log("WebSocket server is running on ws://localhost:8080");
+// Drop connections that vanished without a close frame (closed laptop, lost network).
+const heartbeat = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (!alive.get(ws))
+            return ws.terminate();
+        alive.set(ws, false);
+        ws.ping();
+    });
+}, 30000);
+wss.on("close", () => clearInterval(heartbeat));
