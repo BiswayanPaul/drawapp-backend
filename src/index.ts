@@ -17,10 +17,18 @@ type Segment = {
   size: number;
 };
 
+type Member = {
+  connectionId: string;
+  userId: string | null;
+  name: string;
+  image: string | null;
+};
+
 type Room = { clients: Set<WebSocket>; history: Segment[] };
 
 const rooms: { [roomId: string]: Room } = {};
 const alive = new WeakMap<WebSocket, boolean>();
+const members = new WeakMap<WebSocket, Member>();
 
 app.get(["/", "/health"], (_req, res) => {
   res.json({ status: "ok", rooms: Object.keys(rooms).length });
@@ -54,10 +62,19 @@ function broadcastToRoom(roomId: string, message: string, senderWs?: WebSocket) 
 function broadcastPresence(roomId: string) {
   const room = rooms[roomId];
   if (!room) return;
+  const users = Array.from(room.clients, (client) => members.get(client)).filter(
+    (member): member is Member => !!member
+  );
   broadcastToRoom(
     roomId,
-    JSON.stringify({ type: "presence", count: room.clients.size })
+    JSON.stringify({ type: "presence", count: room.clients.size, users })
   );
+}
+
+function cleanString(value: unknown, maxLength: number) {
+  return typeof value === "string" && value.trim()
+    ? value.trim().slice(0, maxLength)
+    : null;
 }
 
 function isValidSegment(value: unknown): value is Segment {
@@ -85,6 +102,12 @@ wss.on("connection", function connection(ws, req) {
 
   const room = joinRoom(ws, roomId);
   alive.set(ws, true);
+  members.set(ws, {
+    connectionId: Math.random().toString(36).slice(2, 10),
+    userId: null,
+    name: "Guest",
+    image: null,
+  });
   ws.on("pong", () => alive.set(ws, true));
 
   ws.send(JSON.stringify({ type: "history", segments: room.history }));
@@ -99,6 +122,16 @@ wss.on("connection", function connection(ws, req) {
         room.history.push(segment);
         if (room.history.length > MAX_HISTORY) room.history.shift();
         broadcastToRoom(roomId, JSON.stringify({ type: "draw", segment }), ws);
+      } else if (parsedData.type === "join") {
+        // Identity is self-reported by the client; good enough for showing who's here.
+        const member = members.get(ws);
+        if (member) {
+          const image = cleanString(parsedData.user?.image, 500);
+          member.userId = cleanString(parsedData.user?.id, 64);
+          member.name = cleanString(parsedData.user?.name, 60) ?? "Guest";
+          member.image = image?.startsWith("https://") ? image : null;
+          broadcastPresence(roomId);
+        }
       } else if (parsedData.type === "clear") {
         room.history = [];
         broadcastToRoom(roomId, JSON.stringify({ type: "clear" }), ws);

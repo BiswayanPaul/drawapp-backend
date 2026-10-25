@@ -14,6 +14,7 @@ const MAX_MESSAGE_BYTES = 4 * 1024;
 const ROOM_ID_PATTERN = /^[A-Za-z0-9]{4,12}$/;
 const rooms = {};
 const alive = new WeakMap();
+const members = new WeakMap();
 app.get(["/", "/health"], (_req, res) => {
     res.json({ status: "ok", rooms: Object.keys(rooms).length });
 });
@@ -43,7 +44,13 @@ function broadcastPresence(roomId) {
     const room = rooms[roomId];
     if (!room)
         return;
-    broadcastToRoom(roomId, JSON.stringify({ type: "presence", count: room.clients.size }));
+    const users = Array.from(room.clients, (client) => members.get(client)).filter((member) => !!member);
+    broadcastToRoom(roomId, JSON.stringify({ type: "presence", count: room.clients.size, users }));
+}
+function cleanString(value, maxLength) {
+    return typeof value === "string" && value.trim()
+        ? value.trim().slice(0, maxLength)
+        : null;
 }
 function isValidSegment(value) {
     var _a, _b, _c, _d;
@@ -66,10 +73,17 @@ wss.on("connection", function connection(ws, req) {
     }
     const room = joinRoom(ws, roomId);
     alive.set(ws, true);
+    members.set(ws, {
+        connectionId: Math.random().toString(36).slice(2, 10),
+        userId: null,
+        name: "Guest",
+        image: null,
+    });
     ws.on("pong", () => alive.set(ws, true));
     ws.send(JSON.stringify({ type: "history", segments: room.history }));
     broadcastPresence(roomId);
     ws.on("message", function message(data) {
+        var _a, _b, _c, _d;
         try {
             const parsedData = JSON.parse(data.toString());
             if (parsedData.type === "draw" && isValidSegment(parsedData.segment)) {
@@ -79,6 +93,17 @@ wss.on("connection", function connection(ws, req) {
                 if (room.history.length > MAX_HISTORY)
                     room.history.shift();
                 broadcastToRoom(roomId, JSON.stringify({ type: "draw", segment }), ws);
+            }
+            else if (parsedData.type === "join") {
+                // Identity is self-reported by the client; good enough for showing who's here.
+                const member = members.get(ws);
+                if (member) {
+                    const image = cleanString((_a = parsedData.user) === null || _a === void 0 ? void 0 : _a.image, 500);
+                    member.userId = cleanString((_b = parsedData.user) === null || _b === void 0 ? void 0 : _b.id, 64);
+                    member.name = (_d = cleanString((_c = parsedData.user) === null || _c === void 0 ? void 0 : _c.name, 60)) !== null && _d !== void 0 ? _d : "Guest";
+                    member.image = (image === null || image === void 0 ? void 0 : image.startsWith("https://")) ? image : null;
+                    broadcastPresence(roomId);
+                }
             }
             else if (parsedData.type === "clear") {
                 room.history = [];
