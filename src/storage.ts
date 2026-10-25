@@ -21,17 +21,23 @@ function createPool() {
 
 const pool = createPool();
 
-export async function loadRoom(roomId: string): Promise<DrawElement[]> {
-  if (!pool) return [];
+// Returns null when the room couldn't be read, so callers never overwrite it blindly.
+export async function loadRoom(
+  roomId: string
+): Promise<{ elements: DrawElement[]; accessVersion: number } | null> {
+  if (!pool) return { elements: [], accessVersion: 0 };
   try {
     const { rows } = await pool.query(
-      'SELECT elements FROM "Room" WHERE id = $1',
+      'SELECT elements, "accessVersion" FROM "Room" WHERE id = $1',
       [roomId]
     );
-    return Array.isArray(rows[0]?.elements) ? rows[0].elements : [];
+    return {
+      elements: Array.isArray(rows[0]?.elements) ? rows[0].elements : [],
+      accessVersion: rows[0]?.accessVersion ?? 0,
+    };
   } catch (error) {
     console.error(`Failed to load room ${roomId}`, error);
-    return [];
+    return null;
   }
 }
 

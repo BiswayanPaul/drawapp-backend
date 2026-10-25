@@ -7,7 +7,8 @@ type Base = { id: string; color: string; size: number };
 export type DrawElement =
   | (Base & { kind: "stroke"; points: Point[]; opacity: number })
   | (Base & { kind: "line" | "arrow" | "rect" | "ellipse"; from: Point; to: Point })
-  | (Base & { kind: "text"; at: Point; text: string });
+  | (Base & { kind: "text"; at: Point; text: string })
+  | (Base & { kind: "fill"; at: Point });
 
 export const MAX_POINTS_PER_STROKE = 4000;
 const SHAPE_KINDS = new Set(["line", "arrow", "rect", "ellipse"]);
@@ -57,6 +58,11 @@ export function cleanElement(value: unknown): DrawElement | null {
     const at = cleanPoint(el.at);
     const text = typeof el.text === "string" ? el.text.trim().slice(0, 500) : "";
     return at && text ? { ...base, kind, at, text } : null;
+  }
+
+  if (kind === "fill") {
+    const at = cleanPoint(el.at);
+    return at ? { ...base, kind, at } : null;
   }
 
   return null;

@@ -9,8 +9,10 @@ import {
   cleanPoints,
 } from "./elements";
 import { loadRoom, saveRoom } from "./storage";
+import { TOKEN_SECRET, safeEqual, verifyRoomToken } from "./tokens";
 
 const app = express();
+app.use(express.json({ limit: "4kb" }));
 
 const PORT = process.env.PORT || 8080;
 // Keep rooms bounded; the oldest elements fall off first.
@@ -32,6 +34,10 @@ type Room = {
   clients: Set<WebSocket>;
   elements: Map<string, DrawElement>;
   ready: Promise<void>;
+  // False when the stored copy couldn't be read; saving then would wipe it.
+  persist: boolean;
+  // Unknown (null) if the database couldn't be reached.
+  accessVersion: number | null;
   saveTimer?: NodeJS.Timeout;
   evictTimer?: NodeJS.Timeout;
 };
@@ -39,9 +45,32 @@ type Room = {
 const rooms: { [roomId: string]: Room } = {};
 const alive = new WeakMap<WebSocket, boolean>();
 const members = new WeakMap<WebSocket, Member>();
+const tokenVersions = new WeakMap<WebSocket, number>();
+const ACCESS_REVOKED = 4003;
 
 app.get(["/", "/health"], (_req, res) => {
   res.json({ status: "ok", rooms: Object.keys(rooms).length });
+});
+
+// Called by the Next.js app when a room's password changes: everyone holding an
+// older token is disconnected and has to get a new one (re-entering the password).
+app.post("/internal/rooms/:roomId/revoke", (req, res) => {
+  const auth = req.header("authorization") ?? "";
+  if (!TOKEN_SECRET || !safeEqual(auth, `Bearer ${TOKEN_SECRET}`)) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  const room = rooms[req.params.roomId.toUpperCase()];
+  const accessVersion = Number(req.body?.accessVersion);
+  if (room && Number.isInteger(accessVersion)) {
+    room.accessVersion = accessVersion;
+    room.clients.forEach((client) => {
+      if (tokenVersions.get(client) !== accessVersion) {
+        client.close(ACCESS_REVOKED, "Room access changed");
+      }
+    });
+  }
+  res.json({ ok: true });
 });
 
 const httpServer = app.listen(PORT, () => {
@@ -60,9 +89,13 @@ function getRoom(roomId: string) {
       clients: new Set(),
       elements: new Map(),
       ready: Promise.resolve(),
+      persist: true,
+      accessVersion: null,
     };
-    room.ready = loadRoom(roomId).then((elements) => {
-      elements.forEach((el) => room.elements.set(el.id, el));
+    room.ready = loadRoom(roomId).then((stored) => {
+      room.persist = stored !== null;
+      room.accessVersion = stored?.accessVersion ?? null;
+      stored?.elements.forEach((el) => room.elements.set(el.id, el));
     });
     rooms[roomId] = room;
   }
@@ -70,6 +103,7 @@ function getRoom(roomId: string) {
 }
 
 function scheduleSave(room: Room) {
+  if (!room.persist) return;
   clearTimeout(room.saveTimer);
   room.saveTimer = setTimeout(() => {
     saveRoom(room.id, Array.from(room.elements.values()));
@@ -119,8 +153,8 @@ function handleMessage(ws: WebSocket, room: Room, data: Record<string, any>) {
 
   switch (data.type) {
     case "join": {
-      // Identity is self-reported by the client; good enough for showing who's here.
-      if (!member) return;
+      // Only used without room tokens; with them, identity comes from the signed token.
+      if (!member || TOKEN_SECRET) return;
       const image = cleanString(data.user?.image, 500);
       member.userId = cleanString(data.user?.id, 64);
       member.name = cleanString(data.user?.name, 60) ?? "Guest";
@@ -182,17 +216,24 @@ wss.on("connection", async function connection(ws, req) {
     return;
   }
 
+  const token = TOKEN_SECRET ? verifyRoomToken(String(query.token || "")) : null;
+  if (TOKEN_SECRET && token?.roomId !== roomId) {
+    ws.close(ACCESS_REVOKED, "Invalid room token");
+    return;
+  }
+
   const room = getRoom(roomId);
   clearTimeout(room.evictTimer);
   room.clients.add(ws);
   alive.set(ws, true);
   const member: Member = {
     connectionId: Math.random().toString(36).slice(2, 10),
-    userId: null,
-    name: "Guest",
-    image: null,
+    userId: token?.userId ?? null,
+    name: token?.name ?? "Guest",
+    image: token?.image ?? null,
   };
   members.set(ws, member);
+  if (token) tokenVersions.set(ws, token.accessVersion);
   ws.on("pong", () => alive.set(ws, true));
 
   // Messages can arrive while the room is still loading from the database.
@@ -200,6 +241,7 @@ wss.on("connection", async function connection(ws, req) {
 
   ws.on("message", async function message(raw) {
     await ready;
+    if (ws.readyState !== WebSocket.OPEN) return; // rejected while the room was loading
     try {
       handleMessage(ws, room, JSON.parse(raw.toString()));
     } catch (error) {
@@ -220,6 +262,10 @@ wss.on("connection", async function connection(ws, req) {
 
   await ready;
   if (ws.readyState !== WebSocket.OPEN) return;
+  if (token && room.accessVersion !== null && token.accessVersion !== room.accessVersion) {
+    ws.close(ACCESS_REVOKED, "Room access changed");
+    return;
+  }
   ws.send(
     JSON.stringify({
       type: "init",

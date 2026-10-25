@@ -30,18 +30,22 @@ function createPool() {
     });
 }
 const pool = createPool();
+// Returns null when the room couldn't be read, so callers never overwrite it blindly.
 function loadRoom(roomId) {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a;
+        var _a, _b, _c;
         if (!pool)
-            return [];
+            return { elements: [], accessVersion: 0 };
         try {
-            const { rows } = yield pool.query('SELECT elements FROM "Room" WHERE id = $1', [roomId]);
-            return Array.isArray((_a = rows[0]) === null || _a === void 0 ? void 0 : _a.elements) ? rows[0].elements : [];
+            const { rows } = yield pool.query('SELECT elements, "accessVersion" FROM "Room" WHERE id = $1', [roomId]);
+            return {
+                elements: Array.isArray((_a = rows[0]) === null || _a === void 0 ? void 0 : _a.elements) ? rows[0].elements : [],
+                accessVersion: (_c = (_b = rows[0]) === null || _b === void 0 ? void 0 : _b.accessVersion) !== null && _c !== void 0 ? _c : 0,
+            };
         }
         catch (error) {
             console.error(`Failed to load room ${roomId}`, error);
-            return [];
+            return null;
         }
     });
 }

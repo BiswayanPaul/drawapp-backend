@@ -49,5 +49,9 @@ function cleanElement(value) {
         const text = typeof el.text === "string" ? el.text.trim().slice(0, 500) : "";
         return at && text ? Object.assign(Object.assign({}, base), { kind, at, text }) : null;
     }
+    if (kind === "fill") {
+        const at = cleanPoint(el.at);
+        return at ? Object.assign(Object.assign({}, base), { kind, at }) : null;
+    }
     return null;
 }
