@@ -11,33 +11,16 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.loadRoom = loadRoom;
 exports.saveRoom = saveRoom;
-const pg_1 = require("pg");
+const database_1 = require("./database");
 // Persistence is optional: without DATABASE_URL rooms simply live in memory.
-function createPool() {
-    if (!process.env.DATABASE_URL) {
-        console.warn("DATABASE_URL not set; drawings will not survive restarts.");
-        return null;
-    }
-    const url = new URL(process.env.DATABASE_URL);
-    const sslmode = url.searchParams.get("sslmode");
-    // node-postgres treats sslmode=require as full verification, which rejects
-    // managed providers' self-signed CAs (Aiven). Encrypt without verifying instead.
-    url.searchParams.delete("sslmode");
-    return new pg_1.Pool({
-        connectionString: url.toString(),
-        ssl: sslmode && sslmode !== "disable" ? { rejectUnauthorized: false } : undefined,
-        max: 3,
-    });
-}
-const pool = createPool();
 // Returns null when the room couldn't be read, so callers never overwrite it blindly.
 function loadRoom(roomId) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b, _c;
-        if (!pool)
+        if (!(0, database_1.databaseAvailable)())
             return { elements: [], accessVersion: 0 };
         try {
-            const { rows } = yield pool.query('SELECT elements, "accessVersion" FROM "Room" WHERE id = $1', [roomId]);
+            const { rows } = yield (0, database_1.query)('SELECT elements, "accessVersion" FROM "Room" WHERE id = $1', [roomId]);
             return {
                 elements: Array.isArray((_a = rows[0]) === null || _a === void 0 ? void 0 : _a.elements) ? rows[0].elements : [],
                 accessVersion: (_c = (_b = rows[0]) === null || _b === void 0 ? void 0 : _b.accessVersion) !== null && _c !== void 0 ? _c : 0,
@@ -51,10 +34,10 @@ function loadRoom(roomId) {
 }
 function saveRoom(roomId, elements) {
     return __awaiter(this, void 0, void 0, function* () {
-        if (!pool)
+        if (!(0, database_1.databaseAvailable)())
             return;
         try {
-            yield pool.query(`INSERT INTO "Room" (id, elements, "createdAt", "updatedAt")
+            yield (0, database_1.query)(`INSERT INTO "Room" (id, elements, "createdAt", "updatedAt")
        VALUES ($1, $2, now(), now())
        ON CONFLICT (id) DO UPDATE SET elements = $2, "updatedAt" = now()`, [roomId, JSON.stringify(elements)]);
         }

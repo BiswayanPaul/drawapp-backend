@@ -1,0 +1,37 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// The API uses parameterized pg queries at runtime. Prisma lives here solely as
+// the schema and migration owner, keeping all database operations in this service.
+model User {
+  id        String   @id
+  name      String?
+  email     String   @unique
+  password  String?
+  image     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Room {
+  id            String      @id
+  elements      Json        @default("[]")
+  ownerId       String?
+  passwordHash  String?
+  accessVersion Int         @default(0)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  visits        RoomVisit[]
+}
+
+model RoomVisit {
+  userId    String
+  roomId    String
+  visitedAt DateTime @default(now())
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roomId])
+  @@index([userId, visitedAt])
+}

@@ -11,6 +11,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
+var _a;
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
 const ws_1 = require("ws");
@@ -18,7 +19,31 @@ const url_1 = require("url");
 const elements_1 = require("./elements");
 const storage_1 = require("./storage");
 const tokens_1 = require("./tokens");
+const auth_1 = require("./auth");
+const rooms_1 = require("./rooms");
 const app = (0, express_1.default)();
+const frontendUrl = (_a = process.env.FRONTEND_URL) === null || _a === void 0 ? void 0 : _a.replace(/\/$/, "");
+// The browser client is the only allowed cross-origin caller. Credentialed CORS
+// is required because the API owns the HttpOnly session cookie.
+app.use((req, res, next) => {
+    const origin = req.header("origin");
+    if (origin && frontendUrl && origin === frontendUrl) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Access-Control-Allow-Credentials", "true");
+        res.setHeader("Vary", "Origin");
+    }
+    if (req.method === "OPTIONS") {
+        if (origin && origin !== frontendUrl) {
+            res.sendStatus(403);
+            return;
+        }
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+        res.sendStatus(204);
+        return;
+    }
+    next();
+});
 app.use(express_1.default.json({ limit: "4kb" }));
 const PORT = process.env.PORT || 8080;
 // Keep rooms bounded; the oldest elements fall off first.
@@ -32,6 +57,136 @@ const alive = new WeakMap();
 const members = new WeakMap();
 const tokenVersions = new WeakMap();
 const ACCESS_REVOKED = 4003;
+// Render's proxy can drop custom close codes, so the denial is also sent as a message.
+function denyAccess(ws, reason) {
+    if (ws.readyState === ws_1.WebSocket.OPEN)
+        ws.send(JSON.stringify({ type: "denied" }));
+    ws.close(ACCESS_REVOKED, reason);
+}
+function requestRoomId(value, res) {
+    const roomId = (0, rooms_1.normalizeRoomId)(value);
+    if (!roomId) {
+        res.status(404).json({ error: "Room not found." });
+        return null;
+    }
+    return roomId;
+}
+app.get("/api/auth/session", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        res.json({ user: yield (0, auth_1.currentUser)(req) });
+    }
+    catch (error) {
+        console.error("[auth] Failed to load session", error);
+        res.status(500).json({ error: "Couldn't load your session." });
+    }
+}));
+app.post("/api/auth/register", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const result = yield (0, auth_1.createCredentialsUser)(req.body);
+        if (result.error || !result.user) {
+            res.status(400).json(result);
+            return;
+        }
+        (0, auth_1.setSession)(res, result.user.id);
+        res.status(201).json({ user: result.user });
+    }
+    catch (error) {
+        console.error("[auth] Failed to register", error);
+        res.status(500).json({ error: "Couldn't create your account. Please try again." });
+    }
+}));
+app.post("/api/auth/signin", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const result = yield (0, auth_1.authenticateCredentials)(req.body);
+        if (result.error || !result.user) {
+            res.status(401).json(result);
+            return;
+        }
+        (0, auth_1.setSession)(res, result.user.id);
+        res.json({ user: result.user });
+    }
+    catch (error) {
+        console.error("[auth] Failed to sign in", error);
+        res.status(500).json({ error: "Couldn't sign you in. Please try again." });
+    }
+}));
+app.post("/api/auth/signout", (_req, res) => {
+    (0, auth_1.clearSession)(res);
+    res.status(204).end();
+});
+app.get("/api/auth/google", auth_1.beginGoogleAuth);
+app.get("/api/auth/google/callback", auth_1.finishGoogleAuth);
+app.get("/api/rooms/recent", (req, res) => {
+    (0, auth_1.requireUser)(req, res, (user) => __awaiter(void 0, void 0, void 0, function* () {
+        try {
+            res.json({ rooms: yield (0, rooms_1.recentRooms)(user.id) });
+        }
+        catch (error) {
+            console.error("[rooms] Failed to load recent rooms", error);
+            res.status(500).json({ error: "Couldn't load recent rooms." });
+        }
+    }));
+});
+app.post("/api/rooms", (req, res) => {
+    (0, auth_1.requireUser)(req, res, (user) => __awaiter(void 0, void 0, void 0, function* () {
+        try {
+            const result = yield (0, rooms_1.createRoom)(user, req.body);
+            if (result.error) {
+                res.status(400).json(result);
+                return;
+            }
+            res.status(201).json(result);
+        }
+        catch (error) {
+            console.error("[rooms] Failed to create room", error);
+            res.status(500).json({ error: "Couldn't create the room. Please try again." });
+        }
+    }));
+});
+app.get("/api/rooms/:roomId/access", (req, res) => {
+    const roomId = requestRoomId(req.params.roomId, res);
+    if (!roomId)
+        return;
+    (0, auth_1.requireUser)(req, res, (user) => __awaiter(void 0, void 0, void 0, function* () {
+        try {
+            res.json(yield (0, rooms_1.roomAccess)(roomId, user));
+        }
+        catch (error) {
+            console.error("[rooms] Failed to check room access", error);
+            res.status(500).json({ error: "Couldn't open this room." });
+        }
+    }));
+});
+app.post("/api/rooms/:roomId/unlock", (req, res) => {
+    const roomId = requestRoomId(req.params.roomId, res);
+    if (!roomId)
+        return;
+    (0, auth_1.requireUser)(req, res, (user) => __awaiter(void 0, void 0, void 0, function* () {
+        try {
+            const result = yield (0, rooms_1.unlockRoom)(roomId, user, req.body);
+            res.status(result.error ? 403 : 200).json(result);
+        }
+        catch (error) {
+            console.error("[rooms] Failed to unlock room", error);
+            res.status(500).json({ error: "Couldn't unlock this room." });
+        }
+    }));
+});
+app.patch("/api/rooms/:roomId/privacy", (req, res) => {
+    const roomId = requestRoomId(req.params.roomId, res);
+    if (!roomId)
+        return;
+    (0, auth_1.requireUser)(req, res, (user) => __awaiter(void 0, void 0, void 0, function* () {
+        try {
+            const result = yield (0, rooms_1.updateRoomPassword)(roomId, user, req.body);
+            res.status(result.error ? 403 : 200).json(result);
+        }
+        catch (error) {
+            console.error("[rooms] Failed to update room privacy", error);
+            res.status(500).json({ error: "Couldn't update room privacy." });
+        }
+    }));
+});
 app.get(["/", "/health"], (_req, res) => {
     res.json({ status: "ok", rooms: Object.keys(rooms).length });
 });
@@ -50,7 +205,7 @@ app.post("/internal/rooms/:roomId/revoke", (req, res) => {
         room.accessVersion = accessVersion;
         room.clients.forEach((client) => {
             if (tokenVersions.get(client) !== accessVersion) {
-                client.close(ACCESS_REVOKED, "Room access changed");
+                denyAccess(client, "Room access changed");
             }
         });
     }
@@ -196,7 +351,7 @@ wss.on("connection", function connection(ws, req) {
         }
         const token = tokens_1.TOKEN_SECRET ? (0, tokens_1.verifyRoomToken)(String(query.token || "")) : null;
         if (tokens_1.TOKEN_SECRET && (token === null || token === void 0 ? void 0 : token.roomId) !== roomId) {
-            ws.close(ACCESS_REVOKED, "Invalid room token");
+            denyAccess(ws, "Invalid room token");
             return;
         }
         const room = getRoom(roomId);
@@ -244,7 +399,7 @@ wss.on("connection", function connection(ws, req) {
         if (ws.readyState !== ws_1.WebSocket.OPEN)
             return;
         if (token && room.accessVersion !== null && token.accessVersion !== room.accessVersion) {
-            ws.close(ACCESS_REVOKED, "Room access changed");
+            denyAccess(ws, "Room access changed");
             return;
         }
         ws.send(JSON.stringify({
