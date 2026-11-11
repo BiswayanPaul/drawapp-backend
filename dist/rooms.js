@@ -18,6 +18,7 @@ exports.roomAccess = roomAccess;
 exports.createRoom = createRoom;
 exports.unlockRoom = unlockRoom;
 exports.updateRoomPassword = updateRoomPassword;
+exports.onRoomAccessChanged = onRoomAccessChanged;
 exports.recentRooms = recentRooms;
 const crypto_1 = require("crypto");
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
@@ -150,7 +151,7 @@ function updateRoomPassword(roomId, user, input) {
      WHERE id = $1
      RETURNING "accessVersion"`, [roomId, passwordHash]);
         yield (0, database_1.query)('DELETE FROM "RoomVisit" WHERE "roomId" = $1 AND "userId" <> $2', [roomId, user.id]);
-        yield revokeRoomAccess(roomId, updated[0].accessVersion);
+        revokeRoomAccess(roomId, updated[0].accessVersion);
         return { roomId };
     });
 }
@@ -165,24 +166,10 @@ function recordVisit(userId, roomId) {
         }
     });
 }
-function revokeRoomAccess(roomId, accessVersion) {
-    return __awaiter(this, void 0, void 0, function* () {
-        const secret = roomSecret();
-        const backendUrl = process.env.BACKEND_URL;
-        if (!secret || !backendUrl)
-            return;
-        try {
-            yield fetch(`${backendUrl}/internal/rooms/${roomId}/revoke`, {
-                method: "POST",
-                headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
-                body: JSON.stringify({ accessVersion }),
-                signal: AbortSignal.timeout(4000),
-            });
-        }
-        catch (error) {
-            console.error("[rooms] Failed to revoke stale room tokens", error);
-        }
-    });
+// The realtime server registers this to disconnect sockets holding older tokens.
+let revokeRoomAccess = (_roomId, _accessVersion) => { };
+function onRoomAccessChanged(handler) {
+    revokeRoomAccess = handler;
 }
 function recentRooms(userId_1) {
     return __awaiter(this, arguments, void 0, function* (userId, take = 6) {

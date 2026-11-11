@@ -86,16 +86,23 @@ function cookies(req) {
         .map(([key, value]) => [key, decodeURIComponent(value !== null && value !== void 0 ? value : "")]));
 }
 function cookieOptions(maxAge) {
-    const secure = process.env.NODE_ENV === "production";
-    // The app and API often use different subdomains in production. SameSite=None
-    // lets an explicit, credentialed request from FRONTEND_URL carry this cookie.
+    var _a, _b;
+    // The frontend proxies /api/* here, so cookies are first-party on FRONTEND_URL's
+    // host and Lax is enough (it still rides the top-level OAuth callback redirect).
+    const secure = (_b = (_a = process.env.FRONTEND_URL) === null || _a === void 0 ? void 0 : _a.startsWith("https://")) !== null && _b !== void 0 ? _b : false;
     return [
         "Path=/",
         "HttpOnly",
-        `SameSite=${secure ? "None" : "Lax"}`,
+        "SameSite=Lax",
         ...(secure ? ["Secure"] : []),
         `Max-Age=${maxAge}`,
     ].join("; ");
+}
+// Same path NextAuth used, so the redirect URIs already registered with Google keep working.
+function googleRedirectUri() {
+    var _a;
+    const frontendUrl = (_a = process.env.FRONTEND_URL) === null || _a === void 0 ? void 0 : _a.replace(/\/$/, "");
+    return frontendUrl ? `${frontendUrl}/api/auth/callback/google` : null;
 }
 function writeCookie(res, name, value, maxAge) {
     res.append("Set-Cookie", `${name}=${encodeURIComponent(value)}; ${cookieOptions(maxAge)}`);
@@ -194,8 +201,8 @@ function makeOauthState() {
 }
 function beginGoogleAuth(req, res) {
     const clientId = process.env.AUTH_GOOGLE_ID;
-    const backendUrl = process.env.BACKEND_URL;
-    if (!clientId || !backendUrl || !secret()) {
+    const redirectUri = googleRedirectUri();
+    if (!clientId || !redirectUri || !secret()) {
         res.status(503).json({ error: "Google sign-in is not configured." });
         return;
     }
@@ -208,7 +215,7 @@ function beginGoogleAuth(req, res) {
     const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
     url.search = new URLSearchParams({
         client_id: clientId,
-        redirect_uri: `${backendUrl}/api/auth/google/callback`,
+        redirect_uri: redirectUri,
         response_type: "code",
         scope: "openid email profile",
         state,
@@ -220,7 +227,7 @@ function finishGoogleAuth(req, res) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b, _c;
         const frontendUrl = process.env.FRONTEND_URL;
-        const backendUrl = process.env.BACKEND_URL;
+        const redirectUri = googleRedirectUri();
         const clientId = process.env.AUTH_GOOGLE_ID;
         const clientSecret = process.env.AUTH_GOOGLE_SECRET;
         const state = typeof req.query.state === "string" ? req.query.state : "";
@@ -230,7 +237,7 @@ function finishGoogleAuth(req, res) {
         const fail = (reason) => res.redirect(`${frontendUrl !== null && frontendUrl !== void 0 ? frontendUrl : ""}/signin?error=${reason}`);
         clearOauthState(res);
         if (!frontendUrl ||
-            !backendUrl ||
+            !redirectUri ||
             !clientId ||
             !clientSecret ||
             !code ||
@@ -249,7 +256,7 @@ function finishGoogleAuth(req, res) {
                     code,
                     client_id: clientId,
                     client_secret: clientSecret,
-                    redirect_uri: `${backendUrl}/api/auth/google/callback`,
+                    redirect_uri: redirectUri,
                     grant_type: "authorization_code",
                 }),
             });

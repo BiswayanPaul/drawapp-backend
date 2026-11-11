@@ -8,18 +8,17 @@ migrations/persistence, recent-room data, and the realtime WebSocket service.
 
 1. Copy `.env.example` to `.env` and supply PostgreSQL plus long random secrets.
 2. In Google Cloud, set the authorized redirect URI to
-   `http://localhost:8080/api/auth/google/callback`.
+   `http://localhost:3000/api/auth/callback/google` (the frontend proxies `/api/*` here).
 3. Run `npm install` and then `npm run build`. The build deploys Prisma migrations
    before compiling the TypeScript service.
 4. Run `npm run dev`.
 
-Set `NEXT_PUBLIC_API_URL=http://localhost:8080` and
-`NEXT_PUBLIC_WS_URL=ws://localhost:8080` in the frontend.
+The frontend needs no configuration in development: it proxies `/api/*` to
+`http://localhost:8080` and opens sockets at `ws://localhost:8080`.
 
 ## Deployment
 
-Set `BACKEND_URL` to the externally reachable backend URL and `FRONTEND_URL` to
-the exact frontend origin (no trailing slash). In production the session cookie is
-`Secure` and `SameSite=None`, so HTTPS is required. Use a same-site custom domain
-for the frontend and API when possible; browsers can block third-party cookies on
-unrelated domains.
+Set `FRONTEND_URL` to the exact frontend origin (no trailing slash), e.g.
+`https://drawapp-frontend.vercel.app`. The frontend proxies `/api/*` to this
+service, so the session cookie is first-party on that origin and Google's redirect
+URI is `${FRONTEND_URL}/api/auth/callback/google`. WebSockets connect directly.

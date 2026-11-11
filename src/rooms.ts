@@ -162,7 +162,7 @@ export async function updateRoomPassword(roomId: string, user: ApiUser, input: u
     [roomId, passwordHash]
   );
   await query('DELETE FROM "RoomVisit" WHERE "roomId" = $1 AND "userId" <> $2', [roomId, user.id]);
-  await revokeRoomAccess(roomId, updated[0].accessVersion);
+  revokeRoomAccess(roomId, updated[0].accessVersion);
   return { roomId };
 }
 
@@ -178,20 +178,11 @@ async function recordVisit(userId: string, roomId: string) {
   }
 }
 
-async function revokeRoomAccess(roomId: string, accessVersion: number) {
-  const secret = roomSecret();
-  const backendUrl = process.env.BACKEND_URL;
-  if (!secret || !backendUrl) return;
-  try {
-    await fetch(`${backendUrl}/internal/rooms/${roomId}/revoke`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
-      body: JSON.stringify({ accessVersion }),
-      signal: AbortSignal.timeout(4000),
-    });
-  } catch (error) {
-    console.error("[rooms] Failed to revoke stale room tokens", error);
-  }
+// The realtime server registers this to disconnect sockets holding older tokens.
+let revokeRoomAccess = (_roomId: string, _accessVersion: number) => {};
+
+export function onRoomAccessChanged(handler: typeof revokeRoomAccess) {
+  revokeRoomAccess = handler;
 }
 
 export async function recentRooms(userId: string, take = 6) {

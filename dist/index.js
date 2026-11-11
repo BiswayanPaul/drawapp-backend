@@ -115,7 +115,7 @@ app.post("/api/auth/signout", (_req, res) => {
     res.status(204).end();
 });
 app.get("/api/auth/google", auth_1.beginGoogleAuth);
-app.get("/api/auth/google/callback", auth_1.finishGoogleAuth);
+app.get(["/api/auth/callback/google", "/api/auth/google/callback"], auth_1.finishGoogleAuth);
 app.get("/api/rooms/recent", (req, res) => {
     (0, auth_1.requireUser)(req, res, (user) => __awaiter(void 0, void 0, void 0, function* () {
         try {
@@ -190,26 +190,18 @@ app.patch("/api/rooms/:roomId/privacy", (req, res) => {
 app.get(["/", "/health"], (_req, res) => {
     res.json({ status: "ok", rooms: Object.keys(rooms).length });
 });
-// Called by the Next.js app when a room's password changes: everyone holding an
-// older token is disconnected and has to get a new one (re-entering the password).
-app.post("/internal/rooms/:roomId/revoke", (req, res) => {
-    var _a, _b;
-    const auth = (_a = req.header("authorization")) !== null && _a !== void 0 ? _a : "";
-    if (!tokens_1.TOKEN_SECRET || !(0, tokens_1.safeEqual)(auth, `Bearer ${tokens_1.TOKEN_SECRET}`)) {
-        res.status(401).json({ error: "unauthorized" });
+// When a room's password changes, everyone holding an older token is disconnected
+// and has to get a new one (re-entering the password).
+(0, rooms_1.onRoomAccessChanged)((roomId, accessVersion) => {
+    const room = rooms[roomId];
+    if (!room)
         return;
-    }
-    const room = rooms[req.params.roomId.toUpperCase()];
-    const accessVersion = Number((_b = req.body) === null || _b === void 0 ? void 0 : _b.accessVersion);
-    if (room && Number.isInteger(accessVersion)) {
-        room.accessVersion = accessVersion;
-        room.clients.forEach((client) => {
-            if (tokenVersions.get(client) !== accessVersion) {
-                denyAccess(client, "Room access changed");
-            }
-        });
-    }
-    res.json({ ok: true });
+    room.accessVersion = accessVersion;
+    room.clients.forEach((client) => {
+        if (tokenVersions.get(client) !== accessVersion) {
+            denyAccess(client, "Room access changed");
+        }
+    });
 });
 const httpServer = app.listen(PORT, () => {
     console.log(`HTTP + WebSocket server listening on port ${PORT}`);

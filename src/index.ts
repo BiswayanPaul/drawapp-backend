@@ -9,7 +9,7 @@ import {
   cleanPoints,
 } from "./elements";
 import { loadRoom, saveRoom } from "./storage";
-import { TOKEN_SECRET, safeEqual, verifyRoomToken } from "./tokens";
+import { TOKEN_SECRET, verifyRoomToken } from "./tokens";
 import {
   authenticateCredentials,
   beginGoogleAuth,
@@ -23,6 +23,7 @@ import {
 import {
   createRoom,
   normalizeRoomId,
+  onRoomAccessChanged,
   recentRooms,
   roomAccess,
   unlockRoom,
@@ -149,7 +150,7 @@ app.post("/api/auth/signout", (_req, res) => {
 });
 
 app.get("/api/auth/google", beginGoogleAuth);
-app.get("/api/auth/google/callback", finishGoogleAuth);
+app.get(["/api/auth/callback/google", "/api/auth/google/callback"], finishGoogleAuth);
 
 app.get("/api/rooms/recent", (req, res) => {
   requireUser(req, res, async (user) => {
@@ -223,25 +224,17 @@ app.get(["/", "/health"], (_req, res) => {
   res.json({ status: "ok", rooms: Object.keys(rooms).length });
 });
 
-// Called by the Next.js app when a room's password changes: everyone holding an
-// older token is disconnected and has to get a new one (re-entering the password).
-app.post("/internal/rooms/:roomId/revoke", (req, res) => {
-  const auth = req.header("authorization") ?? "";
-  if (!TOKEN_SECRET || !safeEqual(auth, `Bearer ${TOKEN_SECRET}`)) {
-    res.status(401).json({ error: "unauthorized" });
-    return;
-  }
-  const room = rooms[req.params.roomId.toUpperCase()];
-  const accessVersion = Number(req.body?.accessVersion);
-  if (room && Number.isInteger(accessVersion)) {
-    room.accessVersion = accessVersion;
-    room.clients.forEach((client) => {
-      if (tokenVersions.get(client) !== accessVersion) {
-        denyAccess(client, "Room access changed");
-      }
-    });
-  }
-  res.json({ ok: true });
+// When a room's password changes, everyone holding an older token is disconnected
+// and has to get a new one (re-entering the password).
+onRoomAccessChanged((roomId, accessVersion) => {
+  const room = rooms[roomId];
+  if (!room) return;
+  room.accessVersion = accessVersion;
+  room.clients.forEach((client) => {
+    if (tokenVersions.get(client) !== accessVersion) {
+      denyAccess(client, "Room access changed");
+    }
+  });
 });
 
 const httpServer = app.listen(PORT, () => {
